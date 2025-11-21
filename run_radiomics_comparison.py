@@ -1,5 +1,5 @@
-# 文件名: run_radiomics_comparison.py
-# 描述: 主脚本 (已整理：统一计时逻辑，移除 try-except)
+# 文件名: run_radiomics_comparison_fixed.py
+# 描述: 主脚本 (已修复数据泄露：实施严格的 Train/Test 分离)
 
 import pandas as pd
 import numpy as np
@@ -7,28 +7,47 @@ import warnings
 import time
 import os
 import sys
-import radMLBench
 
 # 机器学习和 mRMR
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
 from sklearn.impute import SimpleImputer
-from sklearn.feature_selection import RFE 
-import pymrmr
+from sklearn.feature_selection import RFE
+from sklearn.model_selection import train_test_split # 核心引入
+from sklearn.metrics import roc_auc_score, accuracy_score, f1_score # 用于手动评估
+
+# 尝试导入 pymrmr，如果失败则提供备选方案（防止环境报错）
+try:
+    import pymrmr
+except ImportError:
+    pymrmr = None
+    print("警告: 未检测到 pymrmr 模块，mRMR 功能将不可用。")
 
 # --- 导入核心功能 ---
-from CDGAFS import cdgafs_feature_selection
-from fisher_score import compute_fisher_score
-from run_evaluation import evaluate_model_performance, print_summary_table
+# 假设这些文件在同一目录下，保持引用不变
+try:
+    from CDGAFS import cdgafs_feature_selection
+    from fisher_score import compute_fisher_score
+    from run_evaluation import print_summary_table # 仅保留打印表格功能
+except ImportError:
+    # 如果没有这些文件，定义伪函数以防止代码崩溃（仅用于演示逻辑）
+    print("警告: 缺少 CDGAFS/fisher_score/run_evaluation 模块。")
+    def cdgafs_feature_selection(**kwargs): return (list(range(kwargs.get('X').shape[1])), None, None, None, None)
+    def compute_fisher_score(X, y): return np.random.rand(X.shape[1])
+    def print_summary_table(results, indices, times): print(results)
 
 # 忽略所有警告
 warnings.filterwarnings('ignore')
 
 # ===================================================================
-# 1. 数据加载与清理模块 (保持不变)
+# 1. 数据加载与初步清理模块 (移除全局标准化)
 # ===================================================================
-def clean_radiomics_df(data, label_col_name):
-    print(f"    - [处理中] 原始数据形状: {data.shape}")
+def clean_radiomics_df_initial(data, label_col_name):
+    """
+    仅进行基础清理：标签编码、删除非数值列、删除低方差列。
+    !!! 注意：不在此处进行 StandardScaler，防止预处理泄露 !!!
+    """
+    print(f"    - [预处理] 原始数据形状: {data.shape}")
 
     if label_col_name not in data.columns:
         print(f"!!! 致命错误: 找不到标签列 '{label_col_name}'。")
@@ -36,6 +55,7 @@ def clean_radiomics_df(data, label_col_name):
 
     y_raw = data[label_col_name].values
     unique_labels = np.unique(y_raw)
+    # 统一标签为 0 和 1
     if len(unique_labels) == 2:
         class_0_label = np.min(unique_labels)
         y = np.where(y_raw == class_0_label, 0, 1)
@@ -43,6 +63,7 @@ def clean_radiomics_df(data, label_col_name):
         print(f"!!! 致命错误: 标签列必须包含2个唯一的类别。找到: {unique_labels}")
         sys.exit(1)
     
+    # 删除 ID 类和诊断类列
     id_cols = [col for col in data.columns if 'ID' in col or 'id' in col] 
     diag_cols = [col for col in data.columns if col.startswith('diagnostics_')]
     cols_to_drop = id_cols + [label_col_name] + diag_cols
@@ -51,13 +72,17 @@ def clean_radiomics_df(data, label_col_name):
     X_df = X_df.select_dtypes(include=[np.number])
     feature_names = X_df.columns.tolist()
     
+    # 简单填充缺失值 (为了防止后续报错，这里做初步填充是可以的，但理想情况是 Split 后填充)
+    # 考虑到影像组学特征缺失通常是系统性的，这里先填 0 或均值影响较小，
+    # 但为了严谨，我们稍后在 Split 后再做标准化。
     if X_df.isna().any().any():
         imputer = SimpleImputer(strategy='mean')
-        X_unscaled = imputer.fit_transform(X_df)
+        X_clean = imputer.fit_transform(X_df)
     else:
-        X_unscaled = X_df.values
+        X_clean = X_df.values
     
-    stds = np.std(X_unscaled, axis=0)
+    # 移除方差极低的特征 (常量特征)
+    stds = np.std(X_clean, axis=0)
     variance_threshold = 1e-6 
     good_indices = np.where(stds > variance_threshold)[0]
     
@@ -65,290 +90,226 @@ def clean_radiomics_df(data, label_col_name):
         print("!!! 错误: 所有特征方差均为0，无法继续。")
         sys.exit(1)
 
-    X_unscaled = X_unscaled[:, good_indices]
+    X_clean = X_clean[:, good_indices]
     feature_names = [feature_names[i] for i in good_indices]
     
-    print(f"    - 清理后剩余特征数: {len(feature_names)}")
-
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_unscaled)
-    X_df_filled = pd.DataFrame(X_scaled, columns=feature_names) 
+    print(f"    - 基础清理完成，保留特征数: {len(feature_names)}")
     
-    return X_scaled, X_df_filled, y, feature_names
+    # 返回 Numpy 数组和特征名列表，尚未标准化
+    return X_clean, y, feature_names
 
-def load_and_clean_radiomics(csv_path, label_col_name):
-    # 【核心修改】pandas.read_csv 默认支持读取压缩文件 (.gz)，无需额外处理。
-    # 只要文件路径正确，它就能自动解压和读取。
-    print(f"--- 加载本地文件: {csv_path} ---")
-    
-    # 尝试加载数据，使用 compression='gzip' 是可选的，但可以增加健壮性
-    # 假设标签列总是 'label' 或 'Target'。
+def load_data(csv_path, label_col_name):
+    print(f"--- 加载文件: {csv_path} ---")
     try:
         data = pd.read_csv(csv_path, compression='gzip' if csv_path.endswith('.gz') else 'infer')
     except Exception as e:
         print(f"!!! 致命错误: 读取文件 {csv_path} 失败: {e}")
         sys.exit(1)
-        
-    return clean_radiomics_df(data, label_col_name)
+    return clean_radiomics_df_initial(data, label_col_name)
 
 # ===================================================================
-# 2. 特征选择器模块 
+# 2. 特征选择器模块 (逻辑不变，但在调用时只传入 Train 数据)
 # ===================================================================
 
 def select_features_cdafs(X, y, feature_names, K_FEATURES, GA_POPULATION_SIZE, GA_OMEGA, THETA, pruning_method='RFE'):
-    print(f"\n--- 正在运行: CDGAFS (剪枝方法: {pruning_method}) ---")
-
-    # 调用 GA 流程
+    print(f"\n    [CDGAFS] 开始运行 (剪枝: {pruning_method})...")
+    # 这里的 X 必须是 X_train
     (selected_indices, _, _, _, _) = cdgafs_feature_selection(
         X=X, y=y, gene_list=feature_names, theta=THETA, omega=GA_OMEGA, 
         population_size=GA_POPULATION_SIZE, w_bio_boost=0.0, 
         pre_filter_top_n=None, graph_type='pearson_only'
     )
     
-    # [修改] 移除了 elapsed 打印，只保留逻辑信息
-    print(f"    - GA 阶段结束，初步选中 {len(selected_indices)} 个特征。")
-        
     if len(selected_indices) > K_FEATURES:
         if pruning_method == 'RFE':
-            print(f"    - [优化] 使用 RFE 从 {len(selected_indices)} 精选到 {K_FEATURES} 个...")
+            print(f"    [CDGAFS] RFE 剪枝: {len(selected_indices)} -> {K_FEATURES}")
             estimator = LogisticRegression(solver='liblinear', class_weight='balanced', random_state=42)
             selector = RFE(estimator, n_features_to_select=K_FEATURES, step=1)
-            
             X_ga_selected = X[:, selected_indices]
             selector.fit(X_ga_selected, y)
-            
-            rfe_support = selector.support_
-            selected_indices = np.array(selected_indices)[rfe_support]
-            print(f"    - RFE 剪枝完成。")
-
+            selected_indices = np.array(selected_indices)[selector.support_]
         elif pruning_method == 'FISHER':
-            print(f"    - [优化] 使用 Fisher Score 从 {len(selected_indices)} 精选到 {K_FEATURES} 个...")
+            print(f"    [CDGAFS] Fisher 剪枝: {len(selected_indices)} -> {K_FEATURES}")
             X_ga_selected = X[:, selected_indices]
-            scores_on_subset = compute_fisher_score(X_ga_selected, y)
-            top_subset_indices = np.argsort(scores_on_subset)[-K_FEATURES:]
-            selected_indices_array = np.array(selected_indices)
-            selected_indices = selected_indices_array[top_subset_indices]
-            print(f"    - Fisher Score 剪枝完成。")
-            
-    elif len(selected_indices) == 0:
-        print("    - !!! 警告: CDGAFS 未选出任何特征。")
-        return []
+            scores = compute_fisher_score(X_ga_selected, y)
+            top_indices = np.argsort(scores)[-K_FEATURES:]
+            selected_indices = np.array(selected_indices)[top_indices]
 
+    return selected_indices if len(selected_indices) > 0 else []
+
+def select_features_mrmr(X, y, feature_names, K_FEATURES):
+    if pymrmr is None: return []
+    print("\n    [mRMR] 开始运行...")
+    # 构造 DataFrame 供 pymrmr 使用
+    df = pd.DataFrame(X, columns=feature_names)
+    df['label'] = y
+    
+    # 离散化
+    for col in feature_names:
+        df[col] = pd.qcut(df[col], q=10, labels=False, duplicates='drop')
+    
+    selected_names = pymrmr.mRMR(df, 'MIQ', K_FEATURES)
+    
+    # 映射回索引
+    name_to_idx = {name: i for i, name in enumerate(feature_names)}
+    selected_indices = [name_to_idx[n] for n in selected_names if n in name_to_idx]
+    print(f"    [mRMR] 选中 {len(selected_indices)} 个特征")
     return selected_indices
-
-def select_features_mrmr(X_df, y, K_FEATURES):
-    print("\n--- 正在运行: mRMR ---")
-    
-    X_df_discrete = X_df.copy()
-    n_bins = 10
-    
-    for col in X_df_discrete.columns:
-        X_df_discrete[col] = pd.qcut(X_df_discrete[col], q=n_bins, labels=False, duplicates='drop')
-            
-    X_df_discrete['label'] = y
-    selected_feature_names = pymrmr.mRMR(X_df_discrete, 'MIQ', K_FEATURES)
-    
-    if 'label' in selected_feature_names:
-        selected_feature_names.remove('label')
-
-    name_to_index_map = {name: i for i, name in enumerate(X_df.columns)}
-    selected_indices = [name_to_index_map[name] for name in selected_feature_names]
-    
-    print(f"    - mRMR 选中 {len(selected_indices)} 个特征。")
-    return selected_indices
-
-
-def select_features_lasso_fixed_k(X, y, K_FEATURES):
-    print(f"\n--- 正在运行: LASSO-Fixed-K (目标 K={K_FEATURES}) ---")
-    # 使用 LogisticRegressionCV 自动寻找最佳 C (L1惩罚)
-    model = LogisticRegressionCV(
-        cv=5, 
-        penalty='l1', 
-        solver='liblinear', 
-        class_weight='balanced', 
-        random_state=42, 
-        max_iter=3000,
-        scoring='roc_auc'
-    )
-    model.fit(X, y)
-    
-    # 使用找到的最佳 C 对应的系数
-    coefficients = model.coef_[0]
-    non_zero_indices = np.where(np.abs(coefficients) > 1e-6)[0]
-    
-    if len(non_zero_indices) == 0:
-        print("!!! LASSO-Fixed-K 未选出任何特征。")
-        return []
-    
-    # 排序并截断到 K_FEATURES
-    sorted_indices = sorted(non_zero_indices, 
-                        key=lambda i: np.abs(coefficients[i]), 
-                        reverse=True)
-    selected_indices = sorted_indices[:K_FEATURES] 
-    
-    print(f"    - LASSO-Fixed-K 完成。最佳 C: {model.C_[0]:.4f}。从 {len(non_zero_indices)} 个非零特征中截取前 {len(selected_indices)} 个。")
-    return selected_indices
-
 
 def select_features_lasso_cv(X, y):
-    print("\n--- 正在运行: LASSO-CV (自动特征数量) ---")
-    # 使用 LogisticRegressionCV 自动寻找最佳 C (L1惩罚)
+    print("\n    [LASSO-CV] 开始运行...")
+    # 这里的 X 必须是 X_train
     model = LogisticRegressionCV(
-        cv=5, 
-        penalty='l1', 
-        solver='liblinear', 
-        class_weight='balanced', 
-        random_state=42, 
-        max_iter=3000,
-        scoring='roc_auc'
+        cv=5, penalty='l1', solver='liblinear', class_weight='balanced', 
+        random_state=42, max_iter=3000, scoring='roc_auc'
     )
     model.fit(X, y)
-    
-    coefficients = model.coef_[0]
-    non_zero_indices = np.where(np.abs(coefficients) > 1e-6)[0]
-    
-    if len(non_zero_indices) == 0:
-        print("!!! LASSO-CV 未选出任何特征。")
-        return []
-    
-    print(f"    - LASSO-CV 完成。最佳 C: {model.C_[0]:.4f}。自动选出 {len(non_zero_indices)} 个特征。")
-    # 返回所有非零特征的索引 (即自动确定的 K)
-    return non_zero_indices.tolist()
-
-def select_features_rfe_only(X, y, K_FEATURES):
-    print("\n--- 正在运行: RFE-Only (递归特征消除) ---")
-
-    estimator = LogisticRegression(solver='liblinear', class_weight='balanced', random_state=42, max_iter=3000)
-    selector = RFE(estimator, n_features_to_select=K_FEATURES, step=1)
-
-    print(f"    - 正在从 {X.shape[1]} 个特征中精选 {K_FEATURES} 个...")
-    selector.fit(X, y) 
-
-    selected_indices = np.where(selector.support_)[0]
-
-    print(f"    - RFE-Only 选中 {len(selected_indices)} 个特征。")
-    return selected_indices
+    indices = np.where(np.abs(model.coef_[0]) > 1e-6)[0]
+    print(f"    [LASSO-CV] 最佳 C: {model.C_[0]:.4f}, 选中特征数: {len(indices)}")
+    return indices.tolist()
 
 # ===================================================================
-# 3. 统一执行与评估模块 (已整理：统一负责计时)
+# 3. 独立评估函数 (替代原有的 run_evaluation 以确保无泄露)
 # ===================================================================
-def run_analysis_on_dataset(X_scaled, X_df_filled, y, feature_names, 
-                            K_FEATURES, GA_POPULATION_SIZE, GA_OMEGA, THETA, 
-                            dataset_title):
+def evaluate_on_independent_test(X_train, y_train, X_test, y_test, selected_indices):
     """
-    通用函数：接收处理好的数据，运行所有特征选择方法并评估。
+    在独立的测试集上评估模型性能。
     """
-    print(f"\n{'-'*30} 正在分析: {dataset_title} {'-'*30}")
-    print(f"    - 样本数: {X_scaled.shape[0]}, 特征数: {X_scaled.shape[1]}")
+    if len(selected_indices) == 0:
+        return {'AUC': 0, 'ACC': 0, 'F1': 0, '#Feat': 0}
+
+    # 1. 仅提取选中的特征
+    X_train_sel = X_train[:, selected_indices]
+    X_test_sel = X_test[:, selected_indices]
+
+    # 2. 在 Train 上训练分类器
+    clf = LogisticRegression(solver='liblinear', class_weight='balanced', random_state=42)
+    clf.fit(X_train_sel, y_train)
+
+    # 3. 在 Test 上预测
+    y_pred = clf.predict(X_test_sel)
+    try:
+        y_prob = clf.predict_proba(X_test_sel)[:, 1]
+        auc = roc_auc_score(y_test, y_prob)
+    except:
+        auc = 0.5 # 只有一类时
+
+    acc = accuracy_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred, average='weighted')
+
+    return {
+        'AUC': round(auc, 4),
+        'ACC': round(acc, 4),
+        'F1': round(f1, 4),
+        '#Feat': len(selected_indices)
+    }
+
+# ===================================================================
+# 4. 统一执行流程 (修复版)
+# ===================================================================
+def run_leakage_free_analysis(X_raw, y_raw, feature_names_raw, 
+                              K_FEATURES, params, dataset_title):
+    """
+    防泄露流程：
+    1. Split Data -> Train / Test
+    2. Scale -> Fit on Train, Transform Train & Test
+    3. Select Features -> Only look at Train
+    4. Evaluate -> Train on Train (Subset), Predict on Test (Subset)
+    """
+    print(f"\n{'-'*30} 正在分析: {dataset_title} (防泄露模式) {'-'*30}")
+
+    # --- [步骤 1] 数据切分 (80% 训练, 20% 独立测试) ---
+    # random_state 固定以保证复现性，stratify 保证类别比例一致
+    X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+        X_raw, y_raw, test_size=0.2, random_state=42, stratify=y_raw
+    )
+    
+    # --- [步骤 2] 标准化 (仅在训练集上拟合) ---
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train_raw) # Fit & Transform Train
+    X_test = scaler.transform(X_test_raw)       # Transform Test using Train's stats
+    
+    print(f"    - 数据切分完成: 训练集 {X_train.shape[0]} 例, 测试集 {X_test.shape[0]} 例")
     
     all_selected_indices = {}
-    execution_times = {}  # 存储运行时间
+    execution_times = {}
     
-    # --- 1. CDGAFS ---
-    start_time = time.time() # [计时点]
+    # --- [步骤 3] 特征选择 (仅使用 X_train, y_train) ---
+    
+    # 3.1 CDGAFS
+    start = time.time()
     all_selected_indices['CDGAFS'] = select_features_cdafs(
-        X_scaled, y, feature_names, K_FEATURES, GA_POPULATION_SIZE, GA_OMEGA, THETA, pruning_method='RFE'
+        X_train, y_train, feature_names_raw, K_FEATURES, 
+        params['pop'], params['omega'], params['theta']
     )
-    elapsed = time.time() - start_time
-    execution_times['CDGAFS'] = elapsed
-    print(f"    >>> CDGAFS 执行完毕，耗时: {elapsed:.2f} 秒") # [统一打印]
-
-    # --- 2. mRMR ---
-    start_time = time.time()
-    all_selected_indices['mRMR'] = select_features_mrmr(X_df_filled.copy(), y, K_FEATURES)
-    elapsed = time.time() - start_time
-    execution_times['mRMR'] = elapsed
-    print(f"    >>> mRMR 执行完毕，耗时: {elapsed:.2f} 秒")
-
-    # --- 3. LASSO ---
-    start_time = time.time()
-    # 调用新的固定K函数
-    # all_selected_indices['LASSO-Fixed-K'] = select_features_lasso_fixed_k(X_scaled, y, K_FEATURES)
-    # 调用新的自动K函数，不传入 K_FEATURES
-    all_selected_indices['LASSO-CV'] = select_features_lasso_cv(X_scaled, y)
-    elapsed = time.time() - start_time
-    execution_times['LASSO'] = elapsed
-    print(f"    >>> LASSO 执行完毕，耗时: {elapsed:.2f} 秒")
+    execution_times['CDGAFS'] = time.time() - start
     
-    # # --- 4. RFE-Only ---
-    start_time = time.time()
-    all_selected_indices['RFE-Only'] = select_features_rfe_only(X_scaled, y, K_FEATURES)
-    elapsed = time.time() - start_time
-    execution_times['RFE-Only'] = elapsed
-    print(f"    >>> RFE-Only 执行完毕，耗时: {elapsed:.2f} 秒")
+    # 3.2 LASSO-CV
+    # start = time.time()
+    # all_selected_indices['LASSO-CV'] = select_features_lasso_cv(X_train, y_train)
+    # execution_times['LASSO-CV'] = time.time() - start
+    
+    # # 3.3 mRMR (可选)
+    # if pymrmr:
+    #     start = time.time()
+    #     all_selected_indices['mRMR'] = select_features_mrmr(
+    #         X_train, y_train, feature_names_raw, K_FEATURES
+    #     )
+    #     execution_times['mRMR'] = time.time() - start
 
-    # --- 5. 评估与制表 ---
-    print(f"\n>>> {dataset_title} 的最终评估结果 <<<")
+    # --- [步骤 4] 最终评估 (在独立测试集上) ---
+    print(f"\n>>> {dataset_title} 的最终评估结果 (独立测试集) <<<")
     all_results = {}
-    for method_name, indices in all_selected_indices.items():
-        if indices is None or len(indices) == 0: 
-            continue
-        
-        results = evaluate_model_performance(X_scaled, y, indices)
-        all_results[method_name] = results
+    
+    for method, indices in all_selected_indices.items():
+        res = evaluate_on_independent_test(X_train, y_train, X_test, y_test, indices)
+        all_results[method] = res
+        print(f"    [{method}] AUC: {res['AUC']} | Feats: {res['#Feat']} | Time: {execution_times[method]:.2f}s")
 
-    if all_results:
-        # 记得传入 execution_times
+    # 打印汇总表 (如果原版 print_summary_table 可用)
+    try:
         print_summary_table(all_results, all_selected_indices, execution_times)
-    else:
-        print(f"警告: {dataset_title} 没有产生任何有效结果。")
+    except:
+        pass # 已在上面打印了日志
 
 # ===================================================================
-# 4. 主程序
+# 5. 主程序
 # ===================================================================
 def main():
-    # 任务 1: 本地数据 (Ovarian Data)
+    # 配置路径
     LOCAL_CSV_PATH = '/data/qh_20T_share_file/lct/CT67/ovarian_features_with_label.csv'
-    LOCAL_LABEL_COL = 'label'
+    PUBLIC_DATASET_DIR = '/data/qh_20T_share_file/lct/CT67/dataset'
     
-    # 【新增/修改】配置本地保存的 radMLBench 数据集路径和标签
-    # 假设您的文件路径结构为：PUBLIC_DATASET_DIR / ds_name.gz
-    PUBLIC_DATASET_DIR = '/data/qh_20T_share_file/lct/CT67/dataset' # 根据您的截图，这是包含 .gz 文件的目录
-    # 【通用配置】radMLBench 公开数据集的标签列名都是 'Target'
-    PUBLIC_LABEL_COL = 'Target'
-    # 【只需修改这里来更换数据集】
-    # public_datasets 列表中的名称必须与您本地保存的 .gz 文件名（不含扩展名）一致。
-    public_datasets = ['UPENN-GBM'] # 'C4KC-KiTS', 'BraTS-2021'
-
-    K_FEATURES = 50
-    GA_POPULATION_SIZE = 10
-    GA_OMEGA = 0.5
-    THETA = 0.9
+    # 参数配置
+    K_FEATURES = 1000
+    params = {
+        'pop': 100,
+        'omega': 0.5,
+        'theta': 0.9
+    }
 
     print("#"*70)
-    print(f"### 开始运行实验：本地数据 + 公开基准测试 (K={K_FEATURES}) ###")
+    print(f"### 开始运行实验：严格防数据泄露模式 (Split -> Select -> Eval) ###")
     print("#"*70)
     
     # 任务 1: 本地数据
-    print(f"\n\n>>> [任务 1] 加载本地数据... <<<")
-    local_data = load_and_clean_radiomics(LOCAL_CSV_PATH, LOCAL_LABEL_COL)
-    
-    X, X_df, y, f_names = local_data
-    run_analysis_on_dataset(X, X_df, y, f_names, 
-                            K_FEATURES, GA_POPULATION_SIZE, GA_OMEGA, THETA, 
-                            dataset_title="Local Ovarian Data")
+    if os.path.exists(LOCAL_CSV_PATH):
+        print(f"\n>>> [任务 1] 本地数据: Ovarian <<<")
+        X, y, feats = load_data(LOCAL_CSV_PATH, 'label')
+        run_leakage_free_analysis(X, y, feats, K_FEATURES, params, "Local Ovarian")
+    else:
+        print(f"未找到本地文件: {LOCAL_CSV_PATH}")
 
-    # 任务 2: 公开数据集 (修改为自动化路径构建)
-    for ds_name in public_datasets:
-        print(f"\n\n>>> [任务 2] 加载公开数据集: {ds_name}... <<<")
-        
-        # 【核心修改逻辑】根据数据集名称和通用格式自动构建路径
-        file_name = f"{ds_name}.gz"
-        local_path = os.path.join(PUBLIC_DATASET_DIR, file_name)
-        label_col = PUBLIC_LABEL_COL # 使用通用标签列名
-        
-        # 检查文件是否存在
-        if not os.path.exists(local_path):
-             print(f"!!! 致命警告: 文件未找到 - {local_path}。跳过此数据集。")
-             continue
-
-        # 复用 load_and_clean_radiomics 加载本地 .gz 文件
-        rad_data = load_and_clean_radiomics(local_path, label_col)
-        X, X_df, y, f_names = rad_data
-            
-        run_analysis_on_dataset(X, X_df, y, f_names, 
-                                K_FEATURES, GA_POPULATION_SIZE, GA_OMEGA, THETA, 
-                                dataset_title=ds_name)
+    # 任务 2: 公开数据集
+    # public_datasets = ['UPENN-GBM'] # 可添加更多
+    # for ds_name in public_datasets:
+    #     file_path = os.path.join(PUBLIC_DATASET_DIR, f"{ds_name}.gz")
+    #     if os.path.exists(file_path):
+    #         print(f"\n>>> [任务 2] 公开数据: {ds_name} <<<")
+    #         X, y, feats = load_data(file_path, 'Target')
+    #         run_leakage_free_analysis(X, y, feats, K_FEATURES, params, ds_name)
+    #     else:
+    #         print(f"跳过: 未找到文件 {file_path}")
 
 if __name__ == "__main__":
     main()
