@@ -275,7 +275,7 @@ def run_strict_analysis(X_raw, y_raw, feature_names_raw, K_FEATURES, params, dat
 # ===================================================================
 def main():
     # 配置路径
-    LOCAL_CSV_PATH = '/data/qh_20T_share_file/lct/CT67/附二.csv'
+    LOCAL_CSV_PATH = '/data/qh_20T_share_file/lct/CT67/ovarian_features_with_label.csv'
     LABEL_COL = 'label'
     PUBLIC_DATASET_DIR = '/data/qh_20T_share_file/lct/CT67/dataset'
 
