@@ -19,7 +19,7 @@ from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, confusion_m
 
 # --- 导入核心功能 (直接导入) ---
 # 如果未安装 pymrmr，请注释掉下面这一行
-import pymrmr 
+from mrmr import mrmr_classif
 from CDGAFS import cdgafs_feature_selection
 from fisher_score import compute_fisher_score
 from run_evaluation import print_summary_table
@@ -107,24 +107,19 @@ def select_features_cdafs(X, y, feature_names, K_FEATURES, GA_POPULATION_SIZE, G
     return selected_indices if len(selected_indices) > 0 else []
 
 def select_features_mrmr(X, y, feature_names, K_FEATURES):
-    print("\n    [mRMR] 开始运行...")
-    # 构造 DataFrame 供 pymrmr 使用
-    df = pd.DataFrame(X, columns=feature_names)
-    df['label'] = y
+    print("\n    [mRMR] 开始运行 (mrmr-selection 高速版)...")
+    start_time = time.time()
     
-    # 离散化 (pymrmr 需要)
-    for col in feature_names:
-        try:
-            df[col] = pd.qcut(df[col], q=10, labels=False, duplicates='drop')
-        except:
-            df[col] = 0 # 处理无法分箱的情况
-            
-    selected_names = pymrmr.mRMR(df, 'MIQ', K_FEATURES)
+    X_df = pd.DataFrame(X, columns=feature_names)
+    y_series = pd.Series(y)
     
-    # 映射回索引
+    # 这个库内部是用 C++ 优化的，且自动并行计算
+    selected_names = mrmr_classif(X=X_df, y=y_series, K=K_FEATURES, show_progress=False)
+    
     name_to_idx = {name: i for i, name in enumerate(feature_names)}
-    selected_indices = [name_to_idx[n] for n in selected_names if n in name_to_idx]
-    print(f"    [mRMR] 选中 {len(selected_indices)} 个特征")
+    selected_indices = [name_to_idx[n] for n in selected_names]
+    
+    print(f"    [mRMR] 耗时: {time.time()-start_time:.2f}s")
     return selected_indices
 
 def select_features_lasso_cv(X, y):
@@ -138,12 +133,30 @@ def select_features_lasso_cv(X, y):
     print(f"    [LASSO-CV] 最佳 C: {model.C_[0]:.4f}, 选中特征数: {len(indices)}")
     return indices.tolist()
 
+# --- 新增 RFE 方法 ---
+def select_features_rfe(X, y, K_FEATURES):
+    print(f"\n    [RFE] 开始运行 (Target K={K_FEATURES})...")
+    # 基模型使用 L2 逻辑回归
+    estimator = LogisticRegression(solver='liblinear', class_weight='balanced', random_state=42)
+    selector = RFE(estimator, n_features_to_select=K_FEATURES, step=50)
+    selector.fit(X, y)
+    
+    selected_indices = np.where(selector.support_)[0]
+    print(f"    [RFE] 选中特征数: {len(selected_indices)}")
+    return selected_indices
+
 # ===================================================================
 # 3. 评估函数
 # ===================================================================
 def evaluate_on_independent_test(X_train, y_train, X_test, y_test, selected_indices):
+    # 如果没有选中特征，返回全0
     if len(selected_indices) == 0:
-        return {'AUC': 0, 'ACC': 0, 'F1': 0, '#Feat': 0}
+        return {
+            'AUC': 0, 'Train_AUC': 0, 
+            'Accuracy': 0, 'Train_Accuracy': 0, 
+            'Sensitivity': 0, 'Specificity': 0, 
+            'F1-Macro': 0, '#Feat': 0
+        }
 
     X_train_sel = X_train[:, selected_indices]
     X_test_sel = X_test[:, selected_indices]
@@ -151,6 +164,7 @@ def evaluate_on_independent_test(X_train, y_train, X_test, y_test, selected_indi
     clf = LogisticRegression(solver='liblinear', class_weight='balanced', random_state=42)
     clf.fit(X_train_sel, y_train)
 
+    # --- 1. 测试集 (Test/Validation) 指标 ---
     y_pred = clf.predict(X_test_sel)
     try:
         y_prob = clf.predict_proba(X_test_sel)[:, 1]
@@ -159,18 +173,31 @@ def evaluate_on_independent_test(X_train, y_train, X_test, y_test, selected_indi
         auc = 0.5
 
     acc = accuracy_score(y_test, y_pred)
-    f1 = f1_score(y_test, y_pred, average='weighted')
+    f1 = f1_score(y_test, y_pred, average='macro') # 注意这里用 macro 以匹配 print_summary_table
     
     tn, fp, fn, tp = confusion_matrix(y_test, y_pred, labels=[0, 1]).ravel()
     spec = tn / (tn + fp) if (tn + fp) > 0 else 0
     sens = tp / (tp + fn) if (tp + fn) > 0 else 0
 
+    # --- 2. 训练集 (Train) 指标 (新增，用于填补表格) ---
+    # 这能帮你判断是否过拟合 (如 Train 1.0 但 Test 0.6)
+    y_train_pred = clf.predict(X_train_sel)
+    try:
+        y_train_prob = clf.predict_proba(X_train_sel)[:, 1]
+        train_auc = roc_auc_score(y_train, y_train_prob)
+    except:
+        train_auc = 0.5
+    train_acc = accuracy_score(y_train, y_train_pred)
+
+    # --- 3. 返回字典 (键名必须严格匹配 run_evaluation.py) ---
     return {
         'AUC': round(auc, 4),
-        'ACC': round(acc, 4),
-        'F1': round(f1, 4),
-        'Sens': round(sens, 4),
-        'Spec': round(spec, 4),
+        'Train_AUC': round(train_auc, 4),
+        'Accuracy': round(acc, 4),
+        'Train_Accuracy': round(train_acc, 4),
+        'Sensitivity': round(sens, 4),
+        'Specificity': round(spec, 4),
+        'F1-Macro': round(f1, 4),
         '#Feat': len(selected_indices)
     }
 
@@ -250,12 +277,17 @@ def run_strict_analysis(X_raw, y_raw, feature_names_raw, K_FEATURES, params, dat
     all_selected_indices['LASSO-CV'] = select_features_lasso_cv(X_train, y_train)
     execution_times['LASSO-CV'] = time.time() - start
     
-    # # 5.3 mRMR (可选 - 暂时注释)
+    # 5.3 mRMR (可选 - 暂时注释)
     start = time.time()
     all_selected_indices['mRMR'] = select_features_mrmr(
         X_train, y_train, feature_names, K_FEATURES
     )
     execution_times['mRMR'] = time.time() - start
+
+    # 5.4 RFE (新增调用)
+    start = time.time()
+    all_selected_indices['RFE'] = select_features_rfe(X_train, y_train, K_FEATURES)
+    execution_times['RFE'] = time.time() - start
 
     # --- 6. 统一评估 & 打印结果 ---
     all_results = {}
@@ -275,17 +307,17 @@ def run_strict_analysis(X_raw, y_raw, feature_names_raw, K_FEATURES, params, dat
 # ===================================================================
 def main():
     # 配置路径
-    LOCAL_CSV_PATH = '/data/qh_20T_share_file/lct/CT67/ovarian_features_with_label.csv'
-    LABEL_COL = 'label'
+    LOCAL_CSV_PATH = '/data/qh_20T_share_file/lct/CT67/qianliexian_features_with_label.csv'
+    LABEL_COL = 'isup2'
     PUBLIC_DATASET_DIR = '/data/qh_20T_share_file/lct/CT67/dataset'
 
     # 原始参数
-    K_FEATURES = 200
+    K_FEATURES = 100
     PARAMS = {
         'pop': 100,
         'omega': 0.5,
-        'theta': 0.9 
-    }
+        'theta': 0.9
+   }
 
     # 任务 1: 本地数据
     if os.path.exists(LOCAL_CSV_PATH):
@@ -297,15 +329,15 @@ def main():
         print(f"未找到文件: {LOCAL_CSV_PATH}")
 
     # 任务 2: 公开数据集 (可选 - 暂时注释)
-    public_datasets = ['UPENN-GBM'] # 可添加更多
-    for ds_name in public_datasets:
-        file_path = os.path.join(PUBLIC_DATASET_DIR, f"{ds_name}.gz")
-        if os.path.exists(file_path):
-            print(f"\n>>> [任务 2] 公开数据: {ds_name} <<<")
-            X_raw, y, feats = load_data_structure_only(file_path, 'Target')
-            run_strict_analysis(X_raw, y, feats, K_FEATURES, PARAMS, ds_name)
-        else:
-            print(f"跳过: 未找到文件 {file_path}")
+    # public_datasets = ['UPENN-GBM'] # 可添加更多 'LGG-1p19qDeletion', 'BraTS-2021', 'Zhang2023', 'UPENN-GBM'
+    # for ds_name in public_datasets:
+    #     file_path = os.path.join(PUBLIC_DATASET_DIR, f"{ds_name}.gz")
+    #     if os.path.exists(file_path):
+    #         print(f"\n>>> [任务 2] 公开数据: {ds_name} <<<")
+    #         X_raw, y, feats = load_data_structure_only(file_path, 'Target')
+    #         run_strict_analysis(X_raw, y, feats, K_FEATURES, PARAMS, ds_name)
+    #     else:
+    #         print(f"跳过: 未找到文件 {file_path}")
 
 if __name__ == "__main__":
     main()
